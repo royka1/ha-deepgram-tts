@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import socket
-from typing import Any
+from typing import AsyncIterator
 
 import aiohttp
 import async_timeout
@@ -138,5 +138,54 @@ class DeepgramTTSApiClient:
         except Exception as exception:  # pylint: disable=broad-except
             msg = f"Something really wrong happened! - {exception}"
             raise DeepgramTTSApiClientError(
+                msg,
+            ) from exception
+
+    async def async_stream_speech(
+        self,
+        text: str,
+        model: str = "aura-2-thalia-en",
+        encoding: str = "mp3",
+    ) -> AsyncIterator[bytes]:
+        """Synthesize speech and yield audio bytes as they arrive.
+
+        Streams the HTTP response body so playback can begin after the first
+        byte instead of waiting for the full synthesis, as recommended in
+        https://developers.deepgram.com/docs/text-to-speech-latency
+        """
+        # Ensure model is not empty
+        if not model or model.strip() == "":
+            model = "aura-2-thalia-en"
+
+        headers = {
+            "Authorization": f"Token {self._api_key}",
+            "Content-Type": "text/plain",
+        }
+        params = {
+            "model": model,
+            "encoding": encoding,
+        }
+        try:
+            async with async_timeout.timeout(30):
+                async with self._session.post(
+                    self._base_url,
+                    data=text.encode("utf-8"),
+                    headers=headers,
+                    params=params,
+                ) as response:
+                    _verify_response_or_raise(response)
+                    # iter_any() yields each buffer as soon as it is received,
+                    # minimising time-to-first-audio.
+                    async for chunk in response.content.iter_any():
+                        if chunk:
+                            yield chunk
+        except TimeoutError as exception:
+            msg = f"Timeout error fetching information - {exception}"
+            raise DeepgramTTSApiClientCommunicationError(
+                msg,
+            ) from exception
+        except (aiohttp.ClientError, socket.gaierror) as exception:
+            msg = f"Error fetching information - {exception}"
+            raise DeepgramTTSApiClientCommunicationError(
                 msg,
             ) from exception

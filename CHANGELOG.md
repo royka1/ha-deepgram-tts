@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.3] - 2026-06-25
+
+### Changed (latency optimizations)
+
+Aligned the streaming path with Deepgram's [text-to-speech latency guidance](https://developers.deepgram.com/docs/text-to-speech-latency):
+
+- **Stream after first byte**: audio is now forwarded from the HTTP response body as it arrives (`response.content.iter_any()`) instead of waiting for each sentence to be fully synthesized (`response.read()`). New `DeepgramTTSApiClient.async_stream_speech()` generator.
+- **Incremental text pass-through**: LLM text chunks are forwarded to the sentence splitter as they are produced, so the first sentence is synthesized while later sentences are still being written, instead of buffering the entire message first.
+- **Removed artificial synthesis delay**: dropped the 150 ms `asyncio.sleep` that preceded every sentence request.
+- **Removed pydub decode/re-encode round-trip**: audio fragments are forwarded directly, which also removes the undeclared `pydub`/`ffmpeg` runtime dependency that could break streaming.
+
+### Fixed
+
+- Streaming no longer hangs when the consumer stops early (e.g. voice barge-in): the look-ahead queue is drained on cleanup.
+
 ## [1.0.2] - 2026-08-01
 
 ### Fixed

@@ -3,19 +3,10 @@ from __future__ import annotations
 import asyncio
 import re
 import logging
-import io
 from typing import AsyncIterable, AsyncGenerator
-
-try:
-    from pydub import AudioSegment
-except ImportError:
-    AudioSegment = None
 
 _LOGGER = logging.getLogger(__name__)
 
-# No trimming - preserve natural audio transitions for smoother streaming
-TRIM_MS_FROM_END = 0
-SYNTHESIS_DELAY_S = 0.15
 SENTENCE_SEPARATORS = "\n。.，,；;！!？?、"
 
 def remove_incompatible_characters(text: str) -> str:
@@ -109,73 +100,41 @@ class DeepgramStreamProcessor:
         if generated_sentences == 0:
             _LOGGER.warning("No sentence was generated for synthesis from the received text.")
 
-    def _trim_end_of_audio(self, audio_data: bytes) -> bytes:
-        """
-        Use pydub to trim TRIM_MS_FROM_END ms from the end of each mp3 fragment.
-        Preserves audio quality while removing unnecessary silence.
-        """
-        if not AudioSegment:
-            return audio_data
-        try:
-            segment = AudioSegment.from_file(io.BytesIO(audio_data), format="mp3")
-            if len(segment) > TRIM_MS_FROM_END:
-                trimmed = segment[:-TRIM_MS_FROM_END]
-                out_buffer = io.BytesIO()
-                trimmed.export(out_buffer, format="mp3")
-                return out_buffer.getvalue()
-            else:
-                out_buffer = io.BytesIO()
-                segment.export(out_buffer, format="mp3")
-                return out_buffer.getvalue()
-        except Exception as e:
-            _LOGGER.warning("Could not trim end of audio, returning original. Error: %s", e)
-            return audio_data
-
-    def _strip_id3(self, mp3_bytes: bytes) -> bytes:
-        """Remove ID3v2 headers from an mp3 fragment (except the first one)."""
-        if mp3_bytes[:3] == b"ID3":
-            # ID3v2 header is 10 bytes + size
-            size = int.from_bytes(mp3_bytes[6:10], "big")
-            return mp3_bytes[10+size:]
-        return mp3_bytes
-
     async def async_process_stream(
         self, text_stream: AsyncIterable[str], model: str
     ) -> AsyncIterable[bytes]:
         """
-        Process the text into sentences, synthesize each one, trim the end and buffer them.
-        Each fragment is yielded as a valid mp3 for streaming.
-        """
-        if not AudioSegment:
-            raise RuntimeError("pydub is not available to join mp3 fragments")
+        Split the incoming text into sentences and synthesize them sequentially,
+        forwarding each audio chunk to the caller as soon as it arrives.
 
-        output_queue = asyncio.Queue(maxsize=10)
+        A small look-ahead queue lets the next sentence be synthesized while the
+        current one is still being streamed, keeping the audio pipeline full
+        without buffering whole fragments in memory.
+        """
+        output_queue: asyncio.Queue = asyncio.Queue(maxsize=10)
         processing_task = asyncio.create_task(
             self._process_all_text(text_stream, output_queue, model)
         )
 
-        idx = 0
-        while True:
-            try:
-                chunk = await output_queue.get()
-                if chunk is None:
+        try:
+            while True:
+                item = await output_queue.get()
+                if item is None:
                     break
+                if isinstance(item, Exception):
+                    raise item
+                yield item
+        finally:
+            if not processing_task.done():
+                processing_task.cancel()
+            # Drain any buffered chunks so a producer blocked on a full queue
+            # (e.g. when the consumer stops early) can unwind instead of hanging.
+            while not output_queue.empty():
                 try:
-                    segment = AudioSegment.from_file(io.BytesIO(chunk), format="mp3")
-                    out_buffer = io.BytesIO()
-                    await asyncio.to_thread(segment.export, out_buffer, format="mp3")
-                    mp3_bytes = out_buffer.getvalue()
-                    yield mp3_bytes
-                except Exception as e:
-                    _LOGGER.error("Error decoding mp3 chunk #%d: %s", idx, e)
-                output_queue.task_done()
-                idx += 1
-            except asyncio.CancelledError:
-                break
-
-        if not processing_task.done():
-            processing_task.cancel()
-            await asyncio.sleep(0)
+                    output_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+            await asyncio.gather(processing_task, return_exceptions=True)
 
     async def _process_all_text(
         self, text_stream: AsyncIterable[str], output_queue: asyncio.Queue, model: str
@@ -183,23 +142,17 @@ class DeepgramStreamProcessor:
         try:
             sentences_generator = self._sentence_generator(self._preprocess_stream(text_stream))
             async for sentence in sentences_generator:
-                await asyncio.sleep(SYNTHESIS_DELAY_S)
                 try:
-                    audio_bytes = await self._client.async_synthesize_speech(
+                    got_audio = False
+                    async for audio_chunk in self._client.async_stream_speech(
                         text=sentence,
                         model=model,
                         encoding="mp3",
-                    )
-                    if not audio_bytes:
+                    ):
+                        got_audio = True
+                        await output_queue.put(audio_chunk)
+                    if not got_audio:
                         _LOGGER.error("Deepgram returned empty audio for sentence: '%s'", sentence)
-                        continue
-                    # Skip trimming when TRIM_MS_FROM_END is 0 for optimal performance
-                    if TRIM_MS_FROM_END > 0:
-                        trimmed_mp3 = await asyncio.to_thread(self._trim_end_of_audio, audio_bytes)
-                        if trimmed_mp3:
-                            await output_queue.put(trimmed_mp3)
-                    else:
-                        await output_queue.put(audio_bytes)
                 except Exception as e:
                     _LOGGER.error("Error processing sentence '%s': %s", sentence[:30], e, exc_info=True)
         finally:

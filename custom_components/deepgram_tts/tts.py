@@ -163,12 +163,13 @@ class DeepgramTtsEntity(TextToSpeechEntity):
             _LOGGER.debug(f"Voice was empty, using default: {voice}")
 
         async def message_gen() -> AsyncGenerator[str, None]:
-            texto = ""
+            # Forward text chunks as the LLM produces them so the first sentence
+            # can be synthesized while later sentences are still being written,
+            # instead of waiting for the full message.
             if hasattr(request, "message_gen") and request.message_gen is not None:
                 async for chunk in request.message_gen:
-                    texto += chunk
-            _LOGGER.debug("Text reconstructed from request.message_gen: '%s' (length=%d)", texto, len(texto))
-            yield texto
+                    if chunk:
+                        yield chunk
 
         audio_generator = self._processor.async_process_stream(message_gen(), model=voice)
         return TTSAudioResponse(extension="mp3", data_gen=audio_generator)
